@@ -1,0 +1,2100 @@
+import csv
+import math
+import os
+import re
+import time
+import unicodedata
+import string
+
+from openai import OpenAI
+
+
+DICTIONARY_FILE = "dictionary_a-e_6letters.txt"
+CSV_FILE = "shiritori_log_v5.csv"
+
+# 最大試行回数
+MAX_GAMES = 2000
+
+
+# ========================================
+# OpenAI API
+# ========================================
+
+client = OpenAI()
+
+
+def build_history_text(history):
+    """
+    回答履歴をプロンプト用の文字列に変換する。
+    """
+
+    history_text = ""
+
+    for player_id, word in history:
+        history_text += f"{player_id}：{word}\n"
+
+    return history_text
+
+
+def get_player_prompt(
+    player_id,
+    player1_id,
+    player2_id,
+    prompt_text_1,
+    prompt_text_2
+):
+    """
+    プレイヤーIDに応じて使用するプロンプトを返す。
+    """
+
+    if player_id == player1_id:
+        return prompt_text_1
+
+    if player_id == player2_id:
+        return prompt_text_2
+
+    # 念のため
+    return prompt_text_1
+
+
+def get_information_disclosure_level(player_id):
+    """
+    プレイヤーIDから情報開示強度を取得する。
+
+    GPT-1 / GPT-2 のように強度指定がない場合は0。
+
+    GPT-1-0 ～ GPT-1-3 /
+    GPT-2-0 ～ GPT-2-3 のように
+    末尾に強度を指定できる。
+
+    例：
+        GPT-1   -> 0
+        GPT-1-2 -> 2
+        GPT-2   -> 0
+        GPT-2-3 -> 3
+    """
+
+    if player_id in ("GPT-1", "GPT-2"):
+        return 0
+
+    match = re.fullmatch(
+        r"GPT-[12]-([0-3])",
+        player_id
+    )
+
+    if match:
+        return int(match.group(1))
+
+    return 0
+
+
+def build_score_information(
+    player_id,
+    score_history
+):
+    """
+    情報開示強度に応じて、
+    LLMへ提示する得点情報を作る。
+
+    強度:
+        0 = 得点情報を開示しない
+        1 = 自分の直前の得点のみ開示
+        2 = 自分と相手の直前の得点を開示
+        3 = これまでの全得点履歴を開示
+
+    score_history:
+        [
+            (player_id, word, score),
+            ...
+        ]
+    """
+
+    level = get_information_disclosure_level(
+        player_id
+    )
+
+    if level == 0 or not score_history:
+        return ""
+
+    # ------------------------------------
+    # 強度1
+    # ------------------------------------
+
+    if level == 1:
+
+        own_history = [
+            (pid, word, score)
+            for pid, word, score in score_history
+            if pid == player_id
+        ]
+
+        if not own_history:
+            return ""
+
+        _, word, score = own_history[-1]
+
+        return (
+            "【得点情報】\n"
+            f"あなたの直前の回答「{word}」"
+            f"の得点：{score}点\n"
+        )
+
+    # ------------------------------------
+    # 強度2
+    # ------------------------------------
+
+    if level == 2:
+
+        recent_own = None
+        recent_other = None
+
+        for pid, word, score in reversed(
+            score_history
+        ):
+
+            if (
+                pid == player_id
+                and recent_own is None
+            ):
+
+                recent_own = (
+                    word,
+                    score
+                )
+
+            elif (
+                pid != player_id
+                and recent_other is None
+            ):
+
+                recent_other = (
+                    pid,
+                    word,
+                    score
+                )
+
+            if (
+                recent_own is not None
+                and recent_other is not None
+            ):
+
+                break
+
+        lines = ["【得点情報】"]
+
+        if recent_own is not None:
+
+            word, score = recent_own
+
+            lines.append(
+                f"あなたの直前の回答「{word}」"
+                f"の得点：{score}点"
+            )
+
+        if recent_other is not None:
+
+            pid, word, score = recent_other
+
+            lines.append(
+                f"{pid}の直前の回答「{word}」"
+                f"の得点：{score}点"
+            )
+
+        if len(lines) == 1:
+            return ""
+
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------
+    # 強度3
+    # ------------------------------------
+
+    lines = [
+        "【得点情報（全履歴）】"
+    ]
+
+    for pid, word, score in score_history:
+
+        lines.append(
+            f"{pid}：{word} → {score}点"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def extract_answer_and_reasoning(
+    raw_result
+):
+    """
+    LLMの出力から
+
+        回答
+        推測・理由
+
+    を分離する。
+
+    想定形式：
+
+        回答：abc
+        推測・理由：cは高得点である可能性がある。
+
+    「推測・理由」が存在しない場合は、
+    最初の非空行を回答として扱う。
+    """
+
+    raw_result = raw_result.strip()
+
+    if not raw_result:
+        return "", ""
+
+    lines = raw_result.splitlines()
+
+    answer = ""
+    reasoning_lines = []
+
+    in_reasoning = False
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        # --------------------------------
+        # 回答
+        # --------------------------------
+
+        if stripped.startswith("回答："):
+
+            answer = (
+                stripped[len("回答："):]
+                .strip()
+            )
+
+            continue
+
+        if stripped.startswith("回答:"):
+
+            answer = (
+                stripped[len("回答:"):]
+                .strip()
+            )
+
+            continue
+
+        # --------------------------------
+        # 推測・理由
+        # --------------------------------
+
+        if stripped.startswith(
+            "推測・理由："
+        ):
+
+            reasoning_lines.append(
+                stripped[len("推測・理由："):]
+                .strip()
+            )
+
+            in_reasoning = True
+
+            continue
+
+        if stripped.startswith(
+            "推測・理由:"
+        ):
+
+            reasoning_lines.append(
+                stripped[len("推測・理由:"):]
+                .strip()
+            )
+
+            in_reasoning = True
+
+            continue
+
+        # --------------------------------
+        # 推測・理由の続き
+        # --------------------------------
+
+        if in_reasoning:
+
+            reasoning_lines.append(
+                stripped
+            )
+
+    # ------------------------------------
+    # 「回答：」形式で取得できなかった場合
+    # ------------------------------------
+
+    if not answer:
+
+        for line in lines:
+
+            stripped = line.strip()
+
+            if stripped:
+
+                answer = stripped
+
+                break
+
+    reasoning = "\n".join(
+        line
+        for line in reasoning_lines
+        if line
+    )
+
+    return answer, reasoning
+
+
+def ask_gpt(
+    prompt_text,
+    max_consecutive,
+    consecutive_count,
+    previous_word,
+    required_char,
+    history,
+    banned_ending,
+    show_reasoning,
+    score_history,
+    player_id
+):
+    """
+    GPTに次の単語を回答させる。
+
+    戻り値：
+        answer,
+        reasoning
+    """
+
+    history_text = build_history_text(
+        history
+    )
+
+    score_information = (
+        build_score_information(
+            player_id,
+            score_history
+        )
+    )
+
+    # ------------------------------------
+    # 推測・理由の出力設定
+    # ------------------------------------
+
+    if show_reasoning:
+
+        reasoning_instruction = """
+【推測・理由の出力】
+回答後に、得点や相手の行動についての
+推測と、その推測に至った理由を簡潔に記述してください。
+
+出力形式は必ず以下にしてください。
+
+回答：XXX
+推測・理由：XXX
+
+推測・理由は、現在利用可能な情報に基づく
+明示的な仮説と、その仮説に至った理由だけを
+簡潔に記述してください。
+"""
+
+    else:
+
+        reasoning_instruction = """
+【回答形式】
+説明や理由は不要です。
+回答する語だけを1つ出してください。
+"""
+
+    # ------------------------------------
+    # プロンプト生成
+    # ------------------------------------
+
+    prompt = f"""{prompt_text}
+
+【現在のゲーム状態】
+禁止語尾：{banned_ending}
+最大連続回答回数：{max_consecutive}回
+現在の連続回答回数：{consecutive_count}回目
+前の単語：{previous_word}
+次に必要な文字：{required_char}
+
+【これまでの回答履歴】
+{history_text}
+
+{score_information}
+
+{reasoning_instruction}
+
+あなたの回答：
+"""
+
+    # ------------------------------------
+    # API
+    # ------------------------------------
+
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        input=prompt
+    )
+
+    raw_result = (
+        response.output_text.strip()
+    )
+
+    print(
+        f"{raw_result}"
+    )
+
+    answer, reasoning = (
+        extract_answer_and_reasoning(
+            raw_result
+        )
+    )
+
+    return answer, reasoning
+
+
+def ask_gpt_continue(
+    prompt_text,
+    max_consecutive,
+    consecutive_count,
+    previous_word,
+    required_char,
+    history,
+    banned_ending,
+    show_reasoning,
+    score_history,
+    player_id
+):
+    """
+    GPTに手番を続けるか判断させる。
+
+    戻り値：
+        continue_input,
+        reasoning
+    """
+
+    history_text = build_history_text(
+        history
+    )
+
+    score_information = (
+        build_score_information(
+            player_id,
+            score_history
+        )
+    )
+
+    # ------------------------------------
+    # 推測・理由の出力設定
+    # ------------------------------------
+
+    if show_reasoning:
+
+        reasoning_instruction = """
+続けて自分が回答する場合は y、
+相手に手番を渡す場合は n
+と回答してください。
+
+その後、判断理由を簡潔に記述してください。
+
+出力形式：
+
+判断：y
+推測・理由：XXX
+
+または
+
+判断：n
+推測・理由：XXX
+"""
+
+    else:
+
+        reasoning_instruction = """
+y または n の1文字だけを回答してください。
+"""
+
+    # ------------------------------------
+    # プロンプト生成
+    # ------------------------------------
+
+    prompt = f"""{prompt_text}
+
+【現在のゲーム状態】
+禁止語尾：{banned_ending}
+最大連続回答回数：{max_consecutive}回
+現在の連続回答回数：{consecutive_count}回目
+前の単語：{previous_word}
+次に必要な文字：{required_char}
+
+【これまでの回答履歴】
+{history_text}
+
+{score_information}
+
+【重要】
+現在は単語を回答する場面ではありません。
+続けて自分が回答するか、
+相手に手番を渡すかを判断してください。
+
+{reasoning_instruction}
+
+あなたの判断：
+"""
+
+    # ------------------------------------
+    # API
+    # ------------------------------------
+
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        input=prompt
+    )
+
+    raw_result = (
+        response.output_text.strip()
+    )
+
+    print(
+        f"続行判断API生出力: "
+        f"[{raw_result}]"
+    )
+
+    result = ""
+    reasoning_lines = []
+
+    # ------------------------------------
+    # 出力解析
+    # ------------------------------------
+
+    lines = raw_result.splitlines()
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        if stripped.startswith("判断："):
+
+            result = (
+                stripped[len("判断："):]
+                .strip()
+                .lower()
+            )
+
+        elif stripped.startswith("判断:"):
+
+            result = (
+                stripped[len("判断:"):]
+                .strip()
+                .lower()
+            )
+
+        elif stripped.startswith(
+            "推測・理由："
+        ):
+
+            reasoning_lines.append(
+                stripped[len("推測・理由："):]
+                .strip()
+            )
+
+        elif stripped.startswith(
+            "推測・理由:"
+        ):
+
+            reasoning_lines.append(
+                stripped[len("推測・理由:"):]
+                .strip()
+            )
+
+        elif reasoning_lines:
+
+            reasoning_lines.append(
+                stripped
+            )
+
+    # ------------------------------------
+    # show_reasoning=False の場合
+    # ------------------------------------
+
+    if not show_reasoning:
+
+        result = raw_result.strip().lower()
+
+    reasoning = "\n".join(
+        line
+        for line in reasoning_lines
+        if line
+    )
+
+    if result == "y":
+
+        return "y", reasoning
+
+    return "n", reasoning
+
+
+# ========================================
+# 続行判断
+# ========================================
+
+def decide_continue(
+    prompt_text,
+    max_consecutive,
+    consecutive_count,
+    previous_word,
+    required_char,
+    history,
+    current_player,
+    other_player,
+    banned_ending,
+    show_reasoning,
+    score_history
+):
+    """
+    正解した単語の後に、
+    次の行動を決定する。
+
+    戻り値：
+        decision,
+        reasoning
+    """
+
+    # ------------------------------------
+    # 最大回数に達した場合
+    # ------------------------------------
+
+    if (
+        consecutive_count
+        >= max_consecutive
+    ):
+
+        print(
+            f"{current_player}は規定回数（"
+            f"{max_consecutive}回）に達しました。"
+        )
+
+        print(
+            f"次のプレイヤー "
+            f"{other_player} に交代します。"
+        )
+
+        return "switch", ""
+
+    # ------------------------------------
+    # GPT同士の自動対戦
+    # ------------------------------------
+
+    if (
+        current_player.startswith("GPT")
+        and other_player.startswith("GPT")
+    ):
+
+        print(
+            f"{current_player}に"
+            f"続行判断を要求します。"
+        )
+
+        continue_input, reasoning = (
+            ask_gpt_continue(
+                prompt_text,
+                max_consecutive,
+                consecutive_count,
+                previous_word,
+                required_char,
+                history,
+                banned_ending,
+                show_reasoning,
+                score_history,
+                current_player
+            )
+        )
+
+        print(
+            f"{current_player}の続行判断 > "
+            f"{continue_input}"
+        )
+
+        if reasoning:
+
+            print(
+                f"{current_player}の推測・理由 > "
+                f"{reasoning}"
+            )
+
+        if continue_input == "y":
+
+            print(
+                f"{current_player}は"
+                f"続行します。"
+            )
+
+            return "continue", reasoning
+
+        print(
+            f"{current_player}は"
+            f"手番を終了します。"
+        )
+
+        return "switch", reasoning
+
+    # ------------------------------------
+    # 手動入力
+    # ------------------------------------
+
+    continue_input = input(
+        f"続けて入力しますか？ y/n"
+        f"（次は{consecutive_count + 1}"
+        f"回目入力） > "
+    ).strip().lower()
+
+    if continue_input == "y":
+
+        return "continue", ""
+
+    print()
+
+    print(
+        f"{current_player}"
+        f"が入力を終了しました。"
+    )
+
+    print(
+        f"次のプレイヤー "
+        f"{other_player} に交代します。"
+    )
+
+    return "switch", ""
+
+
+# ========================================
+# 人工語彙処理
+# ========================================
+
+def normalize_word(text):
+    """
+    人工語彙用の文字列正規化。
+    NFKC正規化のみ行う。
+    """
+
+    return unicodedata.normalize(
+        "NFKC",
+        text
+    )
+
+
+def get_score(word):
+    """
+    人工語の得点を計算する。
+
+    a=1, b=2, ..., z=26 とし、
+    n文字の数値合計の平方根を切り上げる。
+    """
+
+    word = normalize_word(
+        word
+    ).lower()
+
+    total = sum(
+        ord(char) - ord("a") + 1
+        for char in word
+    )
+
+    return math.ceil(
+        math.sqrt(total)
+    )
+
+
+def get_next_char(word):
+    """
+    単語の最後の文字を
+    次の要求文字とする。
+    """
+
+    word = normalize_word(
+        word
+    )
+
+    if not word:
+        return ""
+
+    return word[-1]
+
+
+# ========================================
+# 人工辞書
+# ========================================
+
+def load_dictionary():
+    """
+    dictionary.txtを読み込む。
+    1行につき1語。
+    """
+
+    if not os.path.exists(
+        DICTIONARY_FILE
+    ):
+
+        print(
+            f"辞書ファイルが見つかりません: "
+            f"{DICTIONARY_FILE}"
+        )
+
+        return None
+
+    dictionary = set()
+
+    with open(
+        DICTIONARY_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        for line in f:
+
+            word = line.strip()
+
+            if word:
+
+                dictionary.add(
+                    normalize_word(word)
+                )
+
+    print(
+        f"人工辞書読み込み完了: "
+        f"{len(dictionary):,} 語"
+    )
+
+    return dictionary
+
+
+def get_word_info(
+    dictionary,
+    word,
+    required_char=None
+):
+    """
+    人工辞書から単語情報を取得する。
+    """
+
+    word = normalize_word(
+        word
+    )
+
+    if word not in dictionary:
+
+        return {
+            "dictionary_ok": False,
+            "reading": "",
+            "readings": [],
+            "pos": ""
+        }
+
+    return {
+        "dictionary_ok": True,
+        "reading": word,
+        "readings": [word],
+        "pos": "人工語"
+    }
+
+
+# ========================================
+# CSV
+# ========================================
+
+def initialize_csv():
+    """
+    新しいログファイルが存在しない場合、
+    ヘッダーを作成する。
+    """
+
+    if not os.path.exists(
+        CSV_FILE
+    ):
+
+        with open(
+            CSV_FILE,
+            "w",
+            newline="",
+            encoding="utf-8-sig"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow([
+                "ゲームID",
+                "ターン",
+                "プレイヤーID",
+                "前の単語",
+                "要求文字",
+                "回答",
+                "応答時間_ms",
+                "語頭判定",
+                "辞書判定",
+                "読み",
+                "判定",
+                "終了理由",
+                "勝者ID",
+                "敗者ID",
+                "プロンプトNo",
+                "最大連続回答回数",
+                "禁止語尾",
+                "情報開示強度",
+                "得点",
+                "累計得点",
+                "推測・理由"
+            ])
+
+
+def write_log(
+    game_id,
+    turn,
+    player_id,
+    previous_word,
+    required_char,
+    answer,
+    response_time_ms,
+    head_ok,
+    dictionary_ok,
+    reading,
+    judgment,
+    end_reason,
+    winner_id,
+    loser_id,
+    prompt_no,
+    max_consecutive,
+    banned_ending,
+    information_disclosure_level,
+    score,
+    total_score,
+    reasoning
+):
+    """
+    1ターン分のログをCSVに保存する。
+    """
+
+    with open(
+        CSV_FILE,
+        "a",
+        newline="",
+        encoding="utf-8-sig"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            game_id,
+            turn,
+            player_id,
+            previous_word,
+            required_char,
+            answer,
+            response_time_ms,
+            "○" if head_ok else "×",
+            "○" if dictionary_ok else "×",
+            reading,
+            "○" if judgment else "×",
+            end_reason,
+            winner_id,
+            loser_id,
+            prompt_no,
+            max_consecutive,
+            banned_ending,
+            information_disclosure_level,
+            score,
+            total_score,
+            reasoning
+        ])
+
+
+# ========================================
+# ゲーム本体
+# ========================================
+
+def play_shiritori(
+    dictionary,
+    game_id,
+    prompt_text_1,
+    prompt_text_2,
+    max_consecutive,
+    player1_id,
+    player2_id,
+    prompt_no_1,
+    prompt_no_2,
+    banned_ending,
+    show_reasoning
+):
+    """
+    1ゲームを実行する。
+    """
+
+    # ------------------------------------
+    # プレイヤー状態
+    # ------------------------------------
+
+    current_player = player1_id
+    other_player = player2_id
+
+    consecutive_count = 0
+
+    # ------------------------------------
+    # プレイヤー別得点
+    # ------------------------------------
+
+    player_scores = {
+        player1_id: 0,
+        player2_id: 0
+    }
+
+    # ------------------------------------
+    # 初期状態
+    # ------------------------------------
+
+    previous_word = ""
+    required_char = "a"
+
+    # ------------------------------------
+    # 使用済み単語
+    # ------------------------------------
+
+    used_words = set()
+
+    # ------------------------------------
+    # 回答履歴
+    # ------------------------------------
+
+    history = []
+
+    # ------------------------------------
+    # 得点履歴
+    # ------------------------------------
+
+    score_history = []
+
+    # ------------------------------------
+    # ターン番号
+    # ------------------------------------
+
+    turn = 1
+
+    # ------------------------------------
+    # 開始表示
+    # ------------------------------------
+
+    print()
+    print("=" * 50)
+
+    print(
+        f"ゲームID: {game_id}"
+    )
+
+    print(
+        f"最大連続回答回数: "
+        f"{max_consecutive}"
+    )
+
+    print(
+        f"プレイヤー1: "
+        f"{player1_id}"
+    )
+
+    print(
+        f"プレイヤー2: "
+        f"{player2_id}"
+    )
+
+    print(
+        f"禁止語尾: "
+        f"{banned_ending}"
+    )
+
+    print(
+        f"最初は「{required_char}」"
+        f"から始まる人工語"
+    )
+
+    print("=" * 50)
+
+    # ====================================
+    # ゲームループ
+    # ====================================
+
+    while True:
+
+        # --------------------------------
+        # 使用プロンプトを選択
+        # --------------------------------
+
+        prompt_text = get_player_prompt(
+            current_player,
+            player1_id,
+            player2_id,
+            prompt_text_1,
+            prompt_text_2
+        )
+
+        if current_player == player1_id:
+
+            current_prompt_no = (
+                prompt_no_1
+            )
+
+        else:
+
+            current_prompt_no = (
+                prompt_no_2
+            )
+
+        # --------------------------------
+        # 連続回答回数
+        # --------------------------------
+
+        consecutive_count += 1
+
+        print(
+            f"現在のプレイヤー: "
+            f"{current_player}"
+            f"（{consecutive_count}回目）"
+        )
+
+        # --------------------------------
+        # 単語回答
+        # --------------------------------
+
+        start_time = time.perf_counter()
+
+        reasoning = ""
+
+        if current_player.startswith(
+            "GPT"
+        ):
+
+            answer, reasoning = ask_gpt(
+                prompt_text,
+                max_consecutive,
+                consecutive_count,
+                previous_word,
+                required_char,
+                history,
+                banned_ending,
+                show_reasoning,
+                score_history,
+                current_player
+            )
+
+            print(
+                f"{current_player}の回答 > "
+                f"{answer}"
+            )
+
+            if reasoning:
+
+                print(
+                    f"{current_player}の"
+                    f"推測・理由 > "
+                    f"{reasoning}"
+                )
+
+        else:
+
+            answer = input(
+                "回答 > "
+            ).strip()
+
+        end_time = time.perf_counter()
+
+        response_time_ms = round(
+            (
+                end_time - start_time
+            ) * 1000
+        )
+
+        # --------------------------------
+        # 表記の正規化
+        # --------------------------------
+
+        normalized_answer = (
+            unicodedata.normalize(
+                "NFKC",
+                answer
+            )
+        )
+
+        # --------------------------------
+        # 既出判定
+        # --------------------------------
+
+        already_used = (
+            normalized_answer
+            in used_words
+        )
+
+        # --------------------------------
+        # 辞書判定
+        # --------------------------------
+
+        info = get_word_info(
+            dictionary,
+            answer,
+            required_char
+        )
+
+        dictionary_ok = (
+            info["dictionary_ok"]
+        )
+
+        reading = info["reading"]
+
+        # --------------------------------
+        # 語頭判定
+        # --------------------------------
+
+        normalized_reading = (
+            normalize_word(reading)
+        )
+
+        if normalized_reading:
+
+            answer_head = (
+                normalized_reading[0]
+            )
+
+            head_ok = (
+                answer_head
+                == required_char
+            )
+
+        else:
+
+            head_ok = False
+
+        # --------------------------------
+        # 禁止語尾判定
+        # --------------------------------
+
+        ends_with_banned = (
+            bool(reading)
+            and reading[-1]
+            == banned_ending
+        )
+
+        # --------------------------------
+        # 最終判定
+        # --------------------------------
+
+        judgment = (
+            head_ok
+            and dictionary_ok
+            and not already_used
+            and not ends_with_banned
+        )
+
+        # --------------------------------
+        # 終了理由
+        # --------------------------------
+
+        if already_used:
+
+            end_reason = "既出単語"
+
+        elif not dictionary_ok:
+
+            end_reason = "辞書外"
+
+        elif not head_ok:
+
+            end_reason = "語頭不一致"
+
+        elif ends_with_banned:
+
+            end_reason = (
+                f"禁止語尾「{banned_ending}」"
+            )
+
+        else:
+
+            end_reason = ""
+
+        # --------------------------------
+        # 得点
+        # --------------------------------
+
+        if judgment:
+
+            score = get_score(
+                reading
+            )
+
+            player_scores[
+                current_player
+            ] += score
+
+            # ★重要
+            # 外部評価で得点が確定した時点で
+            # 得点履歴へ追加する。
+            #
+            # 次のLLM呼び出しから、
+            # この得点を情報開示できる。
+
+            score_history.append(
+                (
+                    current_player,
+                    normalized_answer,
+                    score
+                )
+            )
+
+        else:
+
+            score = 0
+
+        total_score = (
+            player_scores[
+                current_player
+            ]
+        )
+
+        # --------------------------------
+        # 勝敗
+        # --------------------------------
+
+        if judgment:
+
+            winner_id = ""
+            loser_id = ""
+
+        else:
+
+            winner_id = other_player
+            loser_id = current_player
+
+        # ====================================
+        # 不正解ならゲーム終了
+        # ====================================
+
+        if not judgment:
+
+            write_log(
+                game_id,
+                turn,
+                current_player,
+                previous_word,
+                required_char,
+                answer,
+                response_time_ms,
+                head_ok,
+                dictionary_ok,
+                reading,
+                judgment,
+                end_reason,
+                winner_id,
+                loser_id,
+                current_prompt_no,
+                max_consecutive,
+                banned_ending,
+                get_information_disclosure_level(
+                    current_player
+                ),
+                score,
+                total_score,
+                reasoning
+            )
+
+            print(
+                f"終了理由: "
+                f"{end_reason}"
+            )
+
+            print(
+                f"勝者: "
+                f"{winner_id}"
+            )
+
+            print(
+                f"敗者: "
+                f"{loser_id}"
+            )
+
+            print(
+                f"得点: 0点 / "
+                f"{current_player}累計: "
+                f"{total_score}点"
+            )
+
+            print(
+                f"最終得点 "
+                f"{player1_id}: "
+                f"{player_scores[player1_id]}点"
+            )
+
+            print(
+                f"最終得点 "
+                f"{player2_id}: "
+                f"{player_scores[player2_id]}点"
+            )
+
+            return True
+
+        # ====================================
+        # 正解ならログ保存
+        # ====================================
+
+        write_log(
+            game_id,
+            turn,
+            current_player,
+            previous_word,
+            required_char,
+            answer,
+            response_time_ms,
+            head_ok,
+            dictionary_ok,
+            reading,
+            judgment,
+            end_reason,
+            winner_id,
+            loser_id,
+            current_prompt_no,
+            max_consecutive,
+            banned_ending,
+            get_information_disclosure_level(
+                current_player
+            ),
+            score,
+            total_score,
+            reasoning
+        )
+
+        print(
+            f"得点: {score}点 / "
+            f"{current_player}累計: "
+            f"{total_score}点"
+        )
+
+        # --------------------------------
+        # 使用済み単語
+        # --------------------------------
+
+        used_words.add(
+            normalized_answer
+        )
+
+        # --------------------------------
+        # 回答履歴
+        # --------------------------------
+
+        history.append(
+            (
+                current_player,
+                normalized_answer
+            )
+        )
+
+        # --------------------------------
+        # ゲーム状態更新
+        # --------------------------------
+
+        previous_word = (
+            normalized_answer
+        )
+
+        required_char = get_next_char(
+            reading
+        )
+
+        turn += 1
+
+        # ====================================
+        # 正解後の次の行動
+        # ====================================
+
+        decision, continue_reasoning = (
+            decide_continue(
+                prompt_text,
+                max_consecutive,
+                consecutive_count,
+                previous_word,
+                required_char,
+                history,
+                current_player,
+                other_player,
+                banned_ending,
+                show_reasoning,
+                score_history
+            )
+        )
+
+        # --------------------------------
+        # 続行
+        # --------------------------------
+
+        if decision == "continue":
+
+            print()
+
+            print(
+                f"現在のプレイヤー: "
+                f"{current_player}"
+            )
+
+            print(
+                f"次は「{required_char}」"
+                f"から始まる人工語"
+            )
+
+            print()
+
+            continue
+
+        # ====================================
+        # 相手へ交代
+        # ====================================
+
+        current_player, other_player = (
+            other_player,
+            current_player
+        )
+
+        consecutive_count = 0
+
+        print()
+
+        print(
+            f"現在のプレイヤー: "
+            f"{current_player}"
+        )
+
+        print(
+            f"次は「{required_char}」"
+            f"から始まる人工語"
+        )
+
+        print()
+
+
+# ========================================
+# プロンプト読み込み
+# ========================================
+
+def load_prompt(prompt_file):
+
+    if not os.path.exists(
+        prompt_file
+    ):
+
+        print(
+            f"プロンプトファイルが見つかりません: "
+            f"{prompt_file}"
+        )
+
+        return None
+
+    with open(
+        prompt_file,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        return f.read().strip()
+
+
+# ========================================
+# 設定入力
+# ========================================
+
+def get_settings():
+
+    # ------------------------------------
+    # GPT-1プロンプト
+    # ------------------------------------
+
+    while True:
+
+        try:
+
+            prompt_no_1 = int(
+                input(
+                    "GPT-1用プロンプトNo > "
+                )
+            )
+
+            if prompt_no_1 >= 10:
+                break
+
+            print(
+                "10以上の数字を入力してください。"
+            )
+
+        except ValueError:
+
+            print(
+                "数字を入力してください。"
+            )
+
+    prompt_file_1 = (
+        f"Prompt{prompt_no_1}.txt"
+    )
+
+    prompt_text_1 = load_prompt(
+        prompt_file_1
+    )
+
+    if prompt_text_1 is None:
+        return None
+
+    # ------------------------------------
+    # GPT-2プロンプト
+    # ------------------------------------
+
+    while True:
+
+        try:
+
+            prompt_no_2 = int(
+                input(
+                    "GPT-2用プロンプトNo > "
+                )
+            )
+
+            if prompt_no_2 >= 10:
+                break
+
+            print(
+                "10以上の数字を入力してください。"
+            )
+
+        except ValueError:
+
+            print(
+                "数字を入力してください。"
+            )
+
+    prompt_file_2 = (
+        f"Prompt{prompt_no_2}.txt"
+    )
+
+    prompt_text_2 = load_prompt(
+        prompt_file_2
+    )
+
+    if prompt_text_2 is None:
+        return None
+
+    # ------------------------------------
+    # 推測・理由表示
+    # ------------------------------------
+
+    while True:
+
+        reasoning_input = input(
+            "途中のLLMの推測・理由を"
+            "出力しますか？（y/n） > "
+        ).strip().lower()
+
+        if reasoning_input in [
+            "y",
+            "n"
+        ]:
+
+            break
+
+        print(
+            "y または n を入力してください。"
+        )
+
+    show_reasoning = (
+        reasoning_input == "y"
+    )
+
+    # ------------------------------------
+    # 最大連続回答回数
+    # ------------------------------------
+
+    while True:
+
+        try:
+
+            max_consecutive = int(
+                input(
+                    "1人が続けて回答できる最大回数 > "
+                )
+            )
+
+            if max_consecutive >= 1:
+
+                break
+
+            print(
+                "1以上の数字を入力してください。"
+            )
+
+        except ValueError:
+
+            print(
+                "数字を入力してください。"
+            )
+
+    # ------------------------------------
+    # 禁止語尾
+    # ------------------------------------
+
+    while True:
+
+        banned_ending = input(
+            "禁止語尾は？（任意のアルファベットの1文字） > "
+        ).strip().lower()
+
+        if (
+            len(banned_ending) == 1
+            and banned_ending
+            in string.ascii_lowercase
+        ):
+
+            break
+
+        print(
+            "禁止語尾はアルファベット1文字で指定してください。"
+        )
+
+    # ------------------------------------
+    # プレイヤーID
+    # ------------------------------------
+
+    player1_id = input(
+        "プレイヤー1 ID > "
+    ).strip()
+
+    while True:
+
+        player2_id = input(
+            "プレイヤー2 ID > "
+        ).strip()
+
+        if player2_id != player1_id:
+
+            break
+
+        print(
+            "プレイヤーIDは別々にしてください。"
+        )
+
+    # ------------------------------------
+    # 情報開示強度
+    # ------------------------------------
+
+    info_level_1 = (
+        get_information_disclosure_level(
+            player1_id
+        )
+    )
+
+    info_level_2 = (
+        get_information_disclosure_level(
+            player2_id
+        )
+    )
+
+    print(
+        f"{player1_id} の情報開示強度: "
+        f"{info_level_1}"
+    )
+
+    print(
+        f"{player2_id} の情報開示強度: "
+        f"{info_level_2}"
+    )
+
+    # ------------------------------------
+    # 試行回数
+    # ------------------------------------
+
+    while True:
+
+        try:
+
+            game_count = int(
+                input(
+                    "試行回数？（最大2000回） > "
+                )
+            )
+
+            if (
+                1 <= game_count
+                <= MAX_GAMES
+            ):
+
+                break
+
+            print(
+                f"試行回数は1～{MAX_GAMES}回"
+                "で指定してください。"
+            )
+
+        except ValueError:
+
+            print(
+                "数字を入力してください。"
+            )
+
+    return (
+        prompt_no_1,
+        prompt_file_1,
+        prompt_text_1,
+        prompt_no_2,
+        prompt_file_2,
+        prompt_text_2,
+        show_reasoning,
+        max_consecutive,
+        banned_ending,
+        player1_id,
+        player2_id,
+        game_count
+    )
+
+
+# ========================================
+# メイン
+# ========================================
+
+def main():
+
+    print()
+    print("改造しりとり 自動試行")
+    print("=" * 50)
+
+    # ------------------------------------
+    # CSV初期化
+    # ------------------------------------
+
+    initialize_csv()
+
+    # ------------------------------------
+    # 辞書読み込み
+    # ------------------------------------
+
+    dictionary = load_dictionary()
+
+    if dictionary is None:
+        return
+
+    # ------------------------------------
+    # 設定入力
+    # ------------------------------------
+
+    settings = get_settings()
+
+    if settings is None:
+        return
+
+    (
+        prompt_no_1,
+        prompt_file_1,
+        prompt_text_1,
+        prompt_no_2,
+        prompt_file_2,
+        prompt_text_2,
+        show_reasoning,
+        max_consecutive,
+        banned_ending,
+        player1_id,
+        player2_id,
+        game_count
+    ) = settings
+
+    # ------------------------------------
+    # 開始ゲームID
+    # ------------------------------------
+
+    game_id = 1
+
+    print()
+    print("=" * 50)
+
+    print("実験開始")
+
+    print(
+        f"GPT-1用プロンプト: "
+        f"{prompt_file_1}"
+    )
+
+    print(
+        f"GPT-2用プロンプト: "
+        f"{prompt_file_2}"
+    )
+
+    print(
+        f"推測・理由出力: "
+        f"{'ON' if show_reasoning else 'OFF'}"
+    )
+
+    print(
+        f"開始ゲームID: "
+        f"{game_id}"
+    )
+
+    print(
+        f"試行回数: "
+        f"{game_count}"
+    )
+
+    print(
+        f"最大連続回答回数: "
+        f"{max_consecutive}"
+    )
+
+    print(
+        f"禁止語尾: "
+        f"{banned_ending}"
+    )
+
+    print(
+        f"プレイヤー1: "
+        f"{player1_id}"
+    )
+
+    print(
+        f"プレイヤー2: "
+        f"{player2_id}"
+    )
+
+    print(
+        f"{player1_id} 情報開示強度: "
+        f"{get_information_disclosure_level(player1_id)}"
+    )
+
+    print(
+        f"{player2_id} 情報開示強度: "
+        f"{get_information_disclosure_level(player2_id)}"
+    )
+
+    print("=" * 50)
+    print()
+
+    # ------------------------------------
+    # 指定回数だけゲーム実行
+    # ------------------------------------
+
+    completed_games = 0
+
+    try:
+
+        for i in range(
+            game_count
+        ):
+
+            current_game_id = (
+                game_id + i
+            )
+
+            print()
+            print()
+
+            print(
+                "#" * 60
+            )
+
+            print(
+                f"試行 {i + 1} / "
+                f"{game_count}"
+            )
+
+            print(
+                f"ゲームID: "
+                f"{current_game_id}"
+            )
+
+            print(
+                "#" * 60
+            )
+
+            success = play_shiritori(
+                dictionary,
+                current_game_id,
+                prompt_text_1,
+                prompt_text_2,
+                max_consecutive,
+                player1_id,
+                player2_id,
+                prompt_no_1,
+                prompt_no_2,
+                banned_ending,
+                show_reasoning
+            )
+
+            if success:
+
+                completed_games += 1
+
+            print()
+
+            print(
+                f"試行 {i + 1} / "
+                f"{game_count} 完了"
+            )
+
+    except KeyboardInterrupt:
+
+        print()
+        print()
+
+        print(
+            "=" * 60
+        )
+
+        print(
+            "Ctrl+Cにより実験を停止しました。"
+        )
+
+        print(
+            f"完了したゲーム数: "
+            f"{completed_games}"
+        )
+
+        print(
+            "それまでのログはCSVに保存されています。"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        return
+
+    # ------------------------------------
+    # 終了
+    # ------------------------------------
+
+    print()
+    print()
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "全試行終了"
+    )
+
+    print(
+        f"完了したゲーム数: "
+        f"{completed_games} / "
+        f"{game_count}"
+    )
+
+    print(
+        f"ログファイル: "
+        f"{CSV_FILE}"
+    )
+
+    print(
+        "=" * 60
+    )
+
+
+# ========================================
+# 実行
+# ========================================
+
+if __name__ == "__main__":
+    main()
